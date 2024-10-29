@@ -1,0 +1,448 @@
+const cds = require('@sap/cds');
+var XLSX = require("xlsx");
+const { loadDestination } = require('sap-cap-sdm-plugin/lib/util/index')
+const { createBrowserRootByRepositoryIdAndDirectoryPath } = require('sap-cap-sdm-plugin/srv/cmis/request-builders')
+const { setItemsQuantitiesToPreviousValues } = require('./handlers/setItemsQuantitiesToPreviousValuesHandler.js');
+const { renumberItems } = require('./handlers/helpers.js')
+const repositoryId = '4d4ecb70-02a5-44af-bb60-fe18c9e3ef7e'
+const { sendNotification } = require('./handlers/notify.js')
+
+
+
+
+
+
+class request extends cds.ApplicationService {
+
+    async init() {
+
+        const prod_api = await cds.connect.to('OP_API_PRODUCT_SRV_0001');
+        const preq_api = await cds.connect.to('API_PURCHASEREQ_PROCESS_SRV');
+        const { RequestItem, RequestHeader, Attachment, DMSAppAttachment, ChangeView } = this.entities;
+
+
+        this.on('READ', 'Material', async req => {
+            req.query.where("Product <> ''");
+            req.query.SELECT.count = false;
+            return prod_api.run(req.query);
+        });
+
+        this.on('READ', 'Plant', async req => {
+            req.query.SELECT.count = false;
+
+            return prod_api.run(req.query);
+        });
+
+        this.after('READ', 'Plant', req => {
+            const data = req;
+            const plantMap = new Map(
+                data.map(p => [p.ID, p])
+            )
+
+            const uniquePlants = [...plantMap.values()];
+
+            req = uniquePlants;
+        });
+
+        this.on('READ', 'PurchaseRequisition', async req => {
+            return preq_api.run(req.query);
+        });
+
+        this.after('UPDATE', RequestItem.drafts, async req => {
+            if (req.material_ID) {
+                const unitPrice = await prod_api.send('GET', `/A_Product('${req.material_ID}')/to_Valuation`);
+                await cds.update(RequestItem.drafts, req.ID).with({ Price: Number(unitPrice[0]?.StandardPrice) })
+            } else if (req.Quantity) {
+                let headerInfo = { TotalPrice: 0.00 }
+                let result = await cds.read(RequestItem.drafts)
+                    .where({ ID: req.ID }).columns(['requestHeaderID']);
+                let dbItemInfos = await cds.read(RequestItem.drafts)
+                    .where({ requestHeaderID: result[0].requestHeaderID });
+
+                dbItemInfos.forEach(item => {
+                    if (item.Price > 0) {
+                        headerInfo.TotalPrice += Number(item.Price) * Number(item.Quantity);
+                    }
+                })
+                await cds.update(RequestHeader.drafts, result[0].requestHeaderID).with(headerInfo)
+            }
+        })
+
+        this.on('CANCEL', RequestItem.drafts, async (req, next) => {
+            const { requestHeaderID } = await SELECT.one.from(RequestItem.drafts).where({ ID: req.data.ID })
+            await DELETE.from(RequestItem.drafts).where({ ID: req.data.ID })
+            await renumberItems(RequestItem, requestHeaderID)
+            let headerInfo = { TotalPrice: 0.00 }
+            let dbItemInfos = await cds.read(RequestItem.drafts)
+                .where({ requestHeaderID });
+
+            dbItemInfos.forEach(item => {
+                if (item.Price > 0) {
+                    headerInfo.TotalPrice += Number(item.Price) * Number(item.Quantity);
+                }
+
+            })
+            await cds.update(RequestHeader.drafts, requestHeaderID).with(headerInfo)
+        })
+
+
+        this.before('CREATE', Attachment.drafts, req => {
+            req.data.url = `RequestHeader(ID=${req.data.header_ID},IsActiveEntity=true)/_Attachments(ID=${req.data.ID},IsActiveEntity=true)/content`
+        })
+
+        this.after('READ', ChangeView, async req => {
+            for await (const change of req) {
+                const requestItemID = change.serviceEntityPath.match(/RequestItem\(([\w-]+)\)/);
+                if (!requestItemID) {
+                    change.serviceEntityPath = 'Request Header';
+                } else {
+                    const requestItem = await SELECT.one.from(RequestItem).where({ ID: requestItemID[1] })
+                    change.serviceEntityPath = `Request Item number ${requestItem.ReqItemNo}`;
+                }
+            }
+        })
+
+        // for now only for single attachement
+        this.on("CopyAttachments", async ({ data }) => {
+            // array of attachments with the same header_ID
+            const contentsToCopy = (await SELECT.from(Attachment).where({ header_ID: data.requestHeaderID }).columns('content')).map(({ content }) => content)
+            // array of attachments IDs with the same header_ID
+            const copiedAttachmentIDs = (await SELECT.from(Attachment.drafts).where({ header_ID: data.copiedRequestHeaderID }).columns('ID')).map(({ ID }) => ID)
+            for (const [index, copiedAttachment] of copiedAttachmentIDs.entries()) {
+                await UPDATE.entity(Attachment.drafts).where({ ID: copiedAttachment }).with({ content: contentsToCopy[index], url: `RequestHeader(ID=${data.copiedRequestHeaderID},IsActiveEntity=true)/_Attachments(ID=${copiedAttachment},IsActiveEntity=true)/content` })
+            }
+
+        })
+
+        this.on(["CANCEL", "DELETE"], [RequestHeader, RequestHeader.drafts], async (req, next) => {
+
+            const requestHeaderToDelete = await SELECT.one.from(RequestHeader.drafts).where({ ID: req.data.ID })
+
+            if (!requestHeaderToDelete?._Attachments) {
+                return
+            }
+
+            try {
+                // Load the destination
+                const destination = await loadDestination();
+                const srv = await cds.connect.to('cmis-client');
+
+                // Execute CMIS query to list folders
+                const result = await srv.cmisQuery(
+                    repositoryId,
+                    `SELECT * FROM cmis:folder WHERE cmis:name = 'RequestHeader:${req.data.ID}'`,
+                    { maxItems: 100 }
+                ).execute(destination);
+
+
+                if (!result.results || result.results.length === 0) {
+                    // throw new Error('No folders found matching the criteria.');
+                    return next()
+                }
+
+                const folderId = result.results[0].succinctProperties["cmis:objectId"];
+
+                // Read DMSAppAttachment
+                const attachments = await this.read('DMSAppAttachment');
+                const attachmentsToDelete = attachments
+                    .filter(item => item.parentIds && item.parentIds[0] === folderId)
+                    .map(item => item.id);
+
+
+                // Delete attachments
+                for (const attachmentId of attachmentsToDelete) {
+                    await srv.deleteObject(repositoryId, attachmentId).executeRaw(destination);
+                }
+
+                // Delete the folder
+                const deletedFolder = await srv.deleteObject(repositoryId, folderId).executeRaw(destination);
+
+
+            } catch (error) {
+                console.error('Error in ListFolders:', error);
+                req.error({ message: error.message, status: 500 });
+            }
+
+        })
+
+        this.after('each', DMSAppAttachment, async item => {
+            const options = {
+                year: 'numeric',
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: 'numeric',
+                second: 'numeric',
+                hour12: true
+            };
+
+            const date = new Date(item.createdAtDate);
+
+            item.createdAtDate = date.toLocaleString('en-US', options)
+        })
+
+        this.before("NEW", RequestItem.drafts, async ({ data }) => {
+            const { requestHeaderID } = data
+            const { maxNumber } = await SELECT.one`max(ReqItemNoInt) as maxNumber`.from(RequestItem.drafts).where({ requestHeaderID })
+            data.ReqItemNoInt = (!maxNumber ? 10 : Number(maxNumber) + 10)
+            data.ReqItemNo = (!maxNumber ? 10 : Number(maxNumber) + 10).toString()
+        })
+
+
+
+        this.before("CREATE", RequestHeader, async ({ data }, req) => {
+            let statusCode = '200'; // Assume success initially
+            try {
+                const { maxNumber } = await SELECT.one`max(RequestNoInt) as maxNumber`.from(RequestHeader)
+                let iNewNo = (!maxNumber ? 1000000000 : Number(maxNumber) + 1);
+                let TotalPrice = 0.00;
+        
+                // Processing data for arrays
+                if (Array.isArray(data)) {
+                    data.forEach(obj => {
+                        obj.RequestNo = iNewNo.toString();
+                        obj.RequestNoInt = iNewNo;
+                        obj.StatusCode_Code = 'S';
+                        iNewNo++;
+                    });
+                } else {
+                    // Processing data for single object
+                    data.RequestNo = iNewNo.toString();
+                    data.RequestNoInt = iNewNo;
+                    data.StatusCode_Code = 'S';
+                }
+        
+                // Processing Items and calculating TotalPrice
+                if (Array.isArray(data._Items)) {
+                    data._Items.forEach(item => {
+                        TotalPrice += Number(item.Price) * Number(item.Quantity);
+                    });
+                }
+                data.TotalPrice = TotalPrice.toString();
+        
+            } catch (error) {
+                statusCode = '500'; // Set error status code in case of failure
+                console.error("Error in CREATE request:", error);
+            }
+        
+            // Call sendNotification with the status code
+            await sendNotification(statusCode, data);
+        });
+
+        this.after("", RequestHeader, async (req) => {
+
+            if (req.StatusCode_Code === "R") {
+                await setItemsQuantitiesToPreviousValues(req, RequestItem, ChangeView)
+            }
+        })
+
+        this.before("UPDATE", RequestHeader, async ({ data }) => {
+            const { maxNumber } = await SELECT.one`max(ReqItemNoInt) as maxNumber`.from(RequestItem.drafts).where({ ID: data.ID })
+            let iNewNo = (!maxNumber ? 10 : Number(maxNumber) + 10);
+            let TotalPrice = 0.00;
+            if (Array.isArray(data._Items)) {
+                data._Items.forEach(item => {
+                    item.ReqItemNo = iNewNo.toString();
+                    iNewNo += 10;
+                    TotalPrice += Number(item.Price) * Number(item.Quantity);;
+                })
+            }
+            else data._Items.ReqItemNo = iNewNo.toString()
+            if (!data.StatusCode_Code) {
+                data.StatusCode_Code = 'S';
+            }
+            data.TotalPrice = TotalPrice.toString();
+
+        })
+
+        this.after("UPDATE", RequestHeader, async (req) => {
+
+            if (req.StatusCode_Code === "R") {
+                await setItemsQuantitiesToPreviousValues(req, RequestItem, ChangeView)
+            }
+        })
+
+        this.on('RequestApproval', async (req) => {
+            const requestHeaderObj = await SELECT.one.from(RequestHeader).where({ ID: req.params[0].ID })
+            const requestItems = await SELECT`ReqItemNo as ItemNo, ItemDesc, Quantity, Price as ItemPrice, material_ID as Material, plant_ID as Plant`.from(RequestItem).where({ requestHeaderID: req.params[0].ID })
+            var query0 = UPDATE(RequestHeader).set({ StatusCode_Code: 'A' }).where({ ID: req.params[0].ID });
+            const updateStatus = await cds.tx(req).run(query0);
+            //*Change Status to inApproval
+
+
+            req.data = {
+                "definitionId": "us10.buyerportalpoc-aeew31u1.approvalprocess.approvalProcess",
+                "context": {
+                    "requestform": {
+                        "RequestData": {
+                            "RequestId": requestHeaderObj.ID,
+                            "RequestNo": requestHeaderObj.RequestNo,
+                            "RequestDescription": requestHeaderObj.RequestDesc,
+                            "TotalPrice": Number(requestHeaderObj.TotalPrice),
+                            "ReqesteBy": requestHeaderObj.createdBy,
+                            "ReqestItem": requestItems
+                        }
+                    }
+                }
+            };
+            const SPA_API = await cds.connect.to('spa_api');
+            const result = await SPA_API.send('POST', '/public/workflow/rest/v1/workflow-instances', req.data);
+            return result;
+        });
+
+        this.on('RejectApproval', async (req) => {
+            // const requestHeaderObj = await SELECT.one.from(RequestHeader).where({ ID:req.data.ID })
+            var query0 = UPDATE(RequestHeader).set({ StatusCode_Code: 'R', decidedAt: new Date() }).where({ ID: req.data.id });
+            const updateStatus = await cds.tx(req).run(query0);
+            //*Change Status to Rejected
+
+            return {};
+        })
+
+
+        this.after("GET", RequestHeader, async req => {
+            const draftsNew = await SELECT.from(RequestHeader.drafts)
+            const itemDrafts = await SELECT.from(RequestItem.drafts)
+            return true
+        })
+
+        this.on('CreatePurchaseReq', async (req) => {
+            const requestHeaderObj = await SELECT.one.from(RequestHeader).where({ ID: req.data.id })
+            const result1 = await SELECT`ReqItemNo as ItemNo, ItemDesc, Quantity, Price as ItemPrice, material as Material, plant as Plant`.from(RequestItem).where({ ID: req.data.id })
+
+            const ItemData = {};
+
+            for (var i = 0; i < result1.length; i++) {
+
+                var Item = {
+                    "PurchaseRequisitionType": "NB",
+                    "PurchaseRequisitionItemText": result1[i].ItemDesc,
+                    "Material": result1[i].Material,
+                    "RequestedQuantity": result1[i].Quantity,
+                    "PurchaseRequisitionPrice": result1[i].ItemPrice,
+                    "Plant": result1[i].Plant
+                };
+
+                ItemData.push(Item);
+            }
+
+            req.data = {
+                "PurReqnDescription": requestHeaderObj.RequestDesc,
+                "to_PurchaseReqnItem": {
+                    "results": ItemData
+                }
+            }
+            const result = await preq_api.send('POST', '/A_PurchaseReqnItemText', req.data)
+
+            var query0 = UPDATE(RequestHeader).set({ PRNumber: result.PRNumber }).where({ ID: requestHeaderObj.ID });
+            const updateRH = await cds.tx(req).run(query0);
+
+            return {};
+        })
+
+        /**
+         * Entity handler used for excel upload
+         * @param {req} req - Request object
+         * @param {next}
+         * @returns Success/Error message wrapped in req object
+         */
+        this.on('PUT', 'ExcelUpload', async (req, next) => {
+            if (!req.data.excel) {
+                req.error(400, "No data read.")
+                return next();
+            }
+            else {
+                const oPassThrough = new stream.PassThrough();
+                let aChunks = [];
+
+                req.data.excel.pipe(oPassThrough);
+                //* Need to wrap data read in a Promise, as the .on() call is asynchronous
+                await new Promise((resolve, reject) => {
+                    // Split all of the data into managable chunks
+                    oPassThrough.on('data', oDataChunk => {
+                        aChunks.push(oDataChunk);
+                    });
+                    // When no more data is available for read;
+                    // transform chunks into objects and insert them
+                    oPassThrough.on('end', async () => {
+                        const buffer = Buffer.concat(aChunks);
+                        const workbook = XLSX.read(buffer, { type: "buffer", cellText: true, cellDates: true, dateNF: 'dd"."mm"."yyyy', cellNF: true, rawNumbers: false });
+
+                        // Don't allow for more than one sheet in import
+                        (Array.isArray(workbook.Sheets) && workbook.Sheets.length > 1) && reject(req.error(400, "XSLX file should contain only one sheet."));
+                        let aData = JSON.parse(JSON.stringify(
+                            XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { cellText: true, cellDates: true, dateNF: 'dd"."mm"."yyyy', rawNumbers: false })
+                        ));
+                        // Remove first row - it has names from the template
+                        aData.shift();
+
+                        if (aData.length < 1) {
+                            reject(req.error(400, "File provided was empty."));
+                        }
+                        if (aData.length > 100) {
+                            reject(req.error(400, "Upload of at most 100 records is allowed."));
+                        }
+                        else {
+                            const { Entity: sTargetEntity, HeaderId: sHeaderId } = JSON.parse(req.headers.slug);
+                            let affectedRows;
+
+                            try {
+                                if (sTargetEntity === "RequestItem") {
+                                    affectedRows = await this.update("RequestHeader").where({ ID: sHeaderId }).with({ _Items: aData });
+                                }
+                                else {
+                                    affectedRows = await this.create("RequestHeader", aData);
+                                }
+                            } catch (error) {
+                                reject(req.error(400, error.message));
+                            }
+
+                            if (affectedRows?.length < 0) {
+                                reject(req.error(400, JSON.stringify(data)));
+                            }
+                            else {
+                                resolve(req.notify({
+                                    message: 'Upload Successful',
+                                    status: 200
+                                }));
+                            }
+                        }
+                    })
+                });
+            }
+        });
+
+        this.on('UpdateItemName', async (req) => {
+
+            try {
+                // Load the destination
+                const destination = await loadDestination();
+
+                // Prepare the form data
+                const formData = new FormData();
+                formData.append('cmisaction', 'update');
+                formData.append('objectId', req.data.DMSItemID);
+                formData.append('propertyId[0]', 'cmis:name');
+                formData.append('propertyValue[0]', req.data.fileName);
+
+                // Create the API endpoint URL
+                const directoryPath = `/RequestHeader:${req.data.requestHeaderID}`;
+                const url = createBrowserRootByRepositoryIdAndDirectoryPath(repositoryId, directoryPath, formData);
+
+                // Execute the request
+                await url.execute(destination);
+
+            } catch (error) {
+                // Log and handle the error
+                console.error('Error in ListFolders:', error);
+                req.error({ message: error.message, status: 500 });
+            }
+
+        });
+
+        await super.init()
+    }
+
+};
+
+module.exports = request
